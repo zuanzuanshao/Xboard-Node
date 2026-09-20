@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +32,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -314,7 +314,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -435,9 +435,8 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		return 0, 0, fmt.Errorf("not running")
 	}
 	toAdd, toRemove := kernel.UserDiff(x.users, users)
-	added, removed = len(toAdd), len(toRemove)
 
-	if added == 0 && removed == 0 {
+	if len(toAdd) == 0 && len(toRemove) == 0 {
 		// Only limits changed — update dispatcher without restart.
 		x.users = users
 		x.mu.Unlock()
@@ -456,33 +455,42 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		if err = x.Start(nc, users, t); err != nil {
 			return 0, 0, err
 		}
-		return
+		return len(toAdd), len(toRemove), nil
 	}
 
 	proto := x.protocol
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
+	// Validate every new account before removing any working identity.
+	accounts := make([]*protocol.MemoryUser, len(toAdd))
+	for i, u := range toAdd {
+		account, buildErr := toMemoryUser(proto, nc, u)
+		if buildErr != nil {
+			return 0, 0, fmt.Errorf("build account for user %d: %w", u.ID, buildErr)
+		}
+		accounts[i] = account
+	}
+
 	ctx := context.Background()
 
 	// Remove first, then add (order matters for UUID changes on same ID)
 	for _, u := range toRemove {
 		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
+		if removeErr := um.RemoveUser(ctx, email); removeErr != nil {
+			return added, removed, fmt.Errorf("remove user %d: %w", u.ID, removeErr)
 		}
+		removed++
 	}
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
-			continue
+	for i, u := range toAdd {
+		if addErr := um.AddUser(ctx, accounts[i]); addErr != nil {
+			return added, removed, fmt.Errorf("add user %d: %w", u.ID, addErr)
 		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
-		}
+		added++
 	}
 
+	// The service rebuilds the kernel on error; only publish an applied snapshot
+	// after every UserManager operation has succeeded.
 	x.mu.Lock()
 	x.users = users
 	x.mu.Unlock()
@@ -570,9 +578,11 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 		}
 
 	case "shadowsocks":
-		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
-			// 2022-blake3 multi-user mode
-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+		if cipher, ok := ss2022Methods[nc.Cipher]; ok {
+			// Match buildShadowsocks: SS2022 needs a fixed-length Base64 key.
+			key := make([]byte, cipher.size)
+			copy(key, u.UUID)
+			mu.Account = &ss2022.MemoryAccount{Key: base64.StdEncoding.EncodeToString(key)}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
