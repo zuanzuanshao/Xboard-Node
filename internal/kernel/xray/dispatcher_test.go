@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -99,6 +100,49 @@ func TestLimitDispatcher_DelConn(t *testing.T) {
 	}
 }
 
+func TestLimitDispatcher_ConcurrentLimitedConnections(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	const sourceIP = "1.1.1.1"
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
+
+	// Repeatedly race a new connection against the last connection closing.
+	// Both operations must agree on the lifetime of the user's IP map.
+	const workers, iterations = 8, 10000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range iterations {
+				if ld.checkDeviceLimit(email, sourceIP, true) {
+					t.Error("connections from the same IP must remain allowed")
+					return
+				}
+				ld.delConn(email, sourceIP)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	ld.mu.RLock()
+	remaining := len(ld.limitedIPs[email])
+	ld.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("all connections closed, but %d IPs are still tracked", remaining)
+	}
+	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
+		t.Fatal("a new IP should be admitted after the previous connections close")
+	}
+	if !ld.checkDeviceLimit(email, "3.3.3.3", true) {
+		t.Fatal("the device limit must still reject an additional higher-sorting IP")
+	}
+	ld.delConn(email, "2.2.2.2")
+}
+
 func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	ld := newTestDispatcher()
 
@@ -184,7 +228,6 @@ func TestLimitDispatcher_UnlimitedUserFastPath(t *testing.T) {
 		t.Error("should have tracked some IPs")
 	}
 }
-
 
 func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	ld := newTestDispatcher()

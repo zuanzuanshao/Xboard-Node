@@ -287,39 +287,13 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 		return false
 	}
 
-	// Slow path: user has device limit — need deterministic ordering.
-	d.mu.RLock()
-	ips := d.limitedIPs[email]
-	if ips != nil && ips[sourceIP] > 0 {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-
-	if ips != nil && len(ips) < limit {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-	d.mu.RUnlock()
-
-	// Over limit — need write lock for deterministic check.
+	// Keep limited-user admission and refcount changes in one critical section.
+	// delConn can delete the user's map when its last connection closes, so
+	// neither the map nor its capacity may be reused across a lock upgrade.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Re-check under write lock.
-	ips = d.limitedIPs[email]
+	ips := d.limitedIPs[email]
 	if ips == nil {
 		ips = make(map[string]int)
 		d.limitedIPs[email] = ips
