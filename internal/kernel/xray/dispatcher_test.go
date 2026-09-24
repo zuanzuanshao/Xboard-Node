@@ -180,6 +180,51 @@ func TestLimitDispatcher_GetConnectionState(t *testing.T) {
 	}
 }
 
+func TestLimitDispatcher_ConcurrentConnectionStateSnapshot(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 8}, nil)
+
+	const writers, readers, iterations = 4, 4, 20000
+	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var unexpectedlyRejected atomic.Bool
+
+	for worker := range writers {
+		wg.Add(1)
+		go func(sourceIP string) {
+			defer wg.Done()
+			<-start
+			for range iterations {
+				if ld.checkDeviceLimit(email, sourceIP, true) {
+					unexpectedlyRejected.Store(true)
+					return
+				}
+				ld.delConn(email, sourceIP)
+			}
+		}(ips[worker])
+	}
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range iterations {
+				aliveIPs, _ := ld.GetConnectionState()
+				for range aliveIPs[1] {
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	if unexpectedlyRejected.Load() {
+		t.Fatal("connections below the configured device limit must remain allowed")
+	}
+}
+
 func TestLimitDispatcher_ResetConns(t *testing.T) {
 	ld := newTestDispatcher()
 
